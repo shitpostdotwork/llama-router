@@ -90,7 +90,7 @@ Example with `MAX_MODELS_PER_GPU = 1`: models A and B pinned to GPUs `[0, 1]`, C
 - **Eviction policy**: `lru` (default, evicts the model whose last request is oldest) or `fifo` (evicts the earliest-loaded model). Either way, residents with requests still waiting in the queue are only evicted when there is no other candidate on that GPU.
 - **Anti-starvation**: a head-of-queue request whose model isn't loaded holds the queue once it has waited `QUEUE_HEAD_GRACE` (default 0 s), so later requests for the resident model stop being served ahead of it and the swap happens as soon as the in-flight work drains. At 0 arrival order is absolute and two models in alternation pay a swap each time; raising it buys cache hits back at the cost of that ordering. `QUEUE_FORCE_LOAD_TIMEOUT` (default 300 s) stays as the last resort behind it.
 - **Crash recovery**: dead replicas are reaped automatically; the model simply reloads on its next request.
-- **`num_instance > 1`** spawns that many replica processes of the model (requests balance across them by in-flight count). Each replica is a full copy of the weights — VRAM scales linearly.
+- **`num_instance > 1`** spawns that many replica processes of the model (requests balance across them by in-flight count). Each replica is a full copy of the weights — VRAM scales linearly. With a flat `gpus` list every replica is masked to all of those GPUs; give `gpus` as a list of lists to place each replica on its own GPUs instead (see [GPU pinning](#gpu-pinning)).
 - GPU count is autodetected via NVML; override with `ROUTER.NUM_GPUS` (falls back to highest pinned id + 1 when NVML is unavailable).
 - Small overhead note: co-resident models are separate processes, so each pays its own CUDA context (~a few hundred MB per process per GPU it touches).
 
@@ -100,6 +100,14 @@ The `gpus` field on the model's entry (`config.json` `LLM` section, or the `gpus
 
 1. **Scheduler accounting** — residency/eviction are tracked per GPU in `gpus`.
 2. **Physical placement** — the router spawns each llama-server with `CUDA_VISIBLE_DEVICES` set to that model's `gpus`, so the process only ever touches those devices.
+
+**Per-replica placement.** A nested `gpus` gives each replica its own mask, so a small model can run one copy per GPU under one model id:
+
+```json
+"Qwen3.8-27B-swarm": { "num_instance": 3, "gpus": [[0], [1], [2]] }
+```
+
+Replica `i` gets mask `i % len(gpus)`, so `[[0, 1], [2]]` with `num_instance = 4` places two split replicas on GPUs 0+1 and two on GPU 2, and a bare id such as `[[0, 1], 2]` counts as a one-GPU mask. Accounting uses the union of the masks: the model is resident on every GPU it names and evicting it frees all of them. A request locks and marks busy only its own replica's GPUs, and a crashed replica respawns on the mask it held. `/router` reports the masks under `model_placements`.
 
 You do **not** set a `device` key in presets.ini. Masking with `CUDA_VISIBLE_DEVICES` (rather than llama.cpp's `--device`) is deliberate: ggml initializes a CUDA context and reserves buffers on _every visible_ device, so a model pinned via `--device` alone still holds hundreds of MB / a couple GB on the GPUs it isn't computing on — enough to OOM a co-resident model on a tight box. Masking keeps that overhead off other models' GPUs. Because the visible devices are renumbered from 0 inside each process, an absolute `device = CUDA2` would not even resolve; omit it. Unpinned models default to GPU 0 (masked to GPU 0), so on multi-GPU hosts they no longer silently shard across all GPUs.
 
@@ -176,7 +184,7 @@ Import `llama-router.nixosModules.default` into your host and configure:
     models = {
       "Qwen3-4B" = {
         num_instance = 1;
-        gpus = [ 0 1 ];  # omit = GPU 0; "all" or -1 = every GPU
+        gpus = [ 0 1 ];  # omit = GPU 0; "all" or -1 = every GPU; [ [ 0 ] [ 1 ] ] = one replica per GPU
         reasoning_effort = { options = [ "low" "medium" "xhigh" ]; default = "xhigh" };  # advertised via /v1/models; disable = "none" allows thinking-off
         cost = { input = 0.4; cached_input = 0.15; output = 2.5; };  # $/1M tokens, advertised as pricing
         model = "/data/llm-models/Qwen3-4B-Q8_0.gguf";

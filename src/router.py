@@ -17,6 +17,21 @@ from embedding import EmbeddingCfg, EmbeddingPool
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/webui/monitor/history.db")
 
 # INACTIVE/STARTING/STOPPING/ERROR are router-wide lifecycle states; IDLE/SERVING/SWAPPING are per GPU.
+def _flatten_pins(raw: Any) -> list[Any]:
+    """
+    Flattens a "gpus" value one level, so per-replica masks read as plain ids
+
+    Args:
+        raw (Any): The raw "gpus" value from config (list, nested list, id, or None)
+
+    Returns:
+        The ids as a flat list, a scalar wrapped in a list
+    """
+    if not isinstance(raw, list):
+        return [raw]
+    return [g for v in raw for g in (v if isinstance(v, list) else [v])]
+
+
 class Status(Enum):
     INACTIVE = "inactive" # not running
     STARTING = "starting" # during start()
@@ -30,7 +45,7 @@ class Status(Enum):
 class ModelCfg(TypedDict):
     """One model's entry in the router config's LLM section."""
     num_instance: int
-    gpus: NotRequired[list[int] | int | str]
+    gpus: NotRequired[list[int] | list[list[int]] | int | str]
 
 
 class RouterSettings(TypedDict, total=False):
@@ -253,6 +268,11 @@ class LLMRouter:
             mid: self._resolve_gpus(mid, mcfg.get("gpus"))
             for mid, mcfg in self.router_config["LLM"].items()
         }
+        # Per-replica masks: a nested "gpus" gives each replica its own GPUs, a flat one shares the union.
+        self.model_placements: dict[str, list[list[int]]] = {
+            mid: self._resolve_placements(mid, mcfg.get("gpus"))
+            for mid, mcfg in self.router_config["LLM"].items()
+        }
         self.model_loaded_at: dict[str, float] = {} # model -> ts of last successful load
         self.model_last_used: dict[str, float] = {} # model -> ts of last dispatched request (or load)
         self._context_windows: dict[str, int] | None = None # cached per-model effective context (see model_context_windows)
@@ -264,6 +284,8 @@ class LLMRouter:
         self._idle_proc: subprocess.Popen[bytes] | None = None
         self._idle_lock = asyncio.Lock()
         self.port_model: dict[int, str] = {} # port -> model_id hosted by that process (set once loaded)
+        self.port_gpus: dict[int, list[int]] = {} # port -> GPU mask of that replica (set once loaded)
+        self._reserved_ports: set[int] = set() # ports handed out to spawns that have no process yet
         self.inflight: dict[int, int] = {} # port -> requests currently being forwarded
         self._last_load_error: str | None = None # reason the most recent load attempt failed (e.g. worker OOM)
         self._last_load_fatal: bool = False # True if that failure was deterministic (worker exited/failed) -> don't retry
@@ -436,18 +458,18 @@ class LLMRouter:
             pass
         max_pin = 0
         for mcfg in self.router_config["LLM"].values():
-            raw = mcfg.get("gpus")
-            vals = raw if isinstance(raw, list) else [raw]
-            for v in vals:
+            for v in _flatten_pins(mcfg.get("gpus")):
                 if isinstance(v, int) and v > max_pin:
                     max_pin = v
         return max_pin + 1
 
-    def _resolve_gpus(self, model_id: str, raw: list[int] | int | str | None) -> list[int]:
+    def _resolve_gpus(self, model_id: str, raw: list[Any] | int | str | None) -> list[int]:
         """
         Normalizes a model's "gpus" field to a sorted list of valid GPU ids
 
         None maps to [0] (unpinned = GPU 0 only); -1 or "all" maps to every GPU.
+        A nested list (one mask per replica) resolves to the union of its masks,
+        which is what residency and eviction account against.
         Out-of-range and invalid ids are logged and dropped.
 
         Args:
@@ -459,7 +481,7 @@ class LLMRouter:
         """
         if raw is None:
             return [0]
-        items: Iterable[int | str] = raw if isinstance(raw, list) else [raw]
+        items: Iterable[int | str] = _flatten_pins(raw)
         ids: set[int] = set()
         for v in items:
             if isinstance(v, str) and v.strip().lower() in ("all", "*"):
@@ -479,6 +501,49 @@ class LLMRouter:
             print(f"[ROUTER] {model_id}: no valid gpu ids, defaulting to [0]", flush=True)
             return [0]
         return sorted(ids)
+
+    def _resolve_placements(self, model_id: str, raw: list[Any] | int | str | None) -> list[list[int]]:
+        """
+        Resolves a model's "gpus" field into one GPU mask per replica slot
+
+        A nested list such as [[0], [1], [2]] gives replica i the mask at
+        i % len(masks), so three replicas land one per GPU; a bare id inside it
+        counts as a one-GPU mask. Any other form yields a single mask, the
+        union, shared by every replica as before.
+
+        Args:
+            model_id (str)                      : The model whose pins are resolved (for logging)
+            raw (int | str | list | None)       : The raw "gpus" value from config
+
+        Returns:
+            The list of per-replica GPU masks, never empty
+        """
+        if isinstance(raw, list) and any(isinstance(v, list) for v in raw):
+            return [self._resolve_gpus(model_id, v if isinstance(v, list) else [v]) for v in raw]
+        return [self._resolve_gpus(model_id, raw)]
+
+    def _replica_masks(self, model_id: str, target: int) -> list[list[int]]:
+        """
+        Picks the GPU masks of the replicas model_id is missing
+
+        Builds the masks all target replicas should hold, cycling through the
+        model's placements, then strikes off the mask of every live replica.
+
+        Args:
+            model_id (str)  : The model being topped up
+            target (int)    : The configured num_instance
+
+        Returns:
+            One GPU mask per replica still to spawn
+        """
+        placements = self.model_placements.get(model_id) or [self.model_gpus.get(model_id, [0])]
+        wanted = [placements[i % len(placements)] for i in range(target)]
+        have = self.model_ports(model_id)
+        for port in have:
+            held = self.port_gpus.get(port)
+            if held in wanted:
+                wanted.remove(held)
+        return wanted[:max(0, target - len(have))]
 
     def model_context_windows(self) -> dict[str, int]:
         """
@@ -589,6 +654,7 @@ class LLMRouter:
                 print(f"[ROUTER] replica on port {port} (model {mid}) died, reaping", flush=True)
                 del self.processes[port]
                 self.port_model.pop(port, None)
+                self.port_gpus.pop(port, None)
                 self.inflight.pop(port, None)
 
     def model_ports(self, model_id: str) -> list[int]:
@@ -609,7 +675,11 @@ class LLMRouter:
 
     def _alloc_ports(self, n: int) -> list[int]:
         """
-        Picks the n lowest free ports at or above LLM-base-port
+        Picks and reserves the n lowest free ports at or above LLM-base-port
+
+        A port counts as used once reserved, before its process exists, so
+        concurrent loads never share one. The caller releases the reservation
+        with _unreserve_ports once its spawns finish.
 
         Args:
             n (int): The number of ports to allocate
@@ -618,14 +688,24 @@ class LLMRouter:
             The list of n free ports not currently in use
         """
         ports: list[int] = []
-        used = set(self.processes.keys())
+        used = set(self.processes.keys()) | self._reserved_ports
         p = self.router_config["LLM-base-port"]
         while len(ports) < n:
             if p not in used:
                 ports.append(p)
                 used.add(p)
             p += 1
+        self._reserved_ports.update(ports)
         return ports
+
+    def _unreserve_ports(self, ports: Iterable[int]):
+        """
+        Drops the reservation on ports, whose spawns have finished
+
+        Args:
+            ports (Iterable[int]): The ports _alloc_ports handed out
+        """
+        self._reserved_ports.difference_update(ports)
 
     def _replica_exited(self, port: int) -> int | None:
         """
@@ -705,7 +785,7 @@ class LLMRouter:
         for port, count in self.inflight.items():
             if count > 0 and port in self.processes:
                 model = self.port_model.get(port)
-                if model is not None and gpu in self.model_gpus.get(model, [0]):
+                if model is not None and gpu in self.port_gpus.get(port, self.model_gpus.get(model, [0])):
                     return Status.SERVING
         return Status.IDLE
 
@@ -763,9 +843,9 @@ class LLMRouter:
                 affected.update(self.model_gpus.get(m, [0]))
         return sorted(affected)
 
-    async def _start_instance(self, port: int, model_id: str) -> int | None:
+    async def _start_instance(self, port: int, model_id: str, gpus: list[int]) -> int | None:
         """
-        Spawns one llama-server on port, isolated to model_id's pinned GPUs
+        Spawns one llama-server on port, isolated to this replica's GPU mask
 
         The process is masked to its pinned GPUs via CUDA_VISIBLE_DEVICES because
         ggml reserves a context and buffers on every visible device, even ones
@@ -774,17 +854,17 @@ class LLMRouter:
         key, and devices renumber from 0 inside the process. Waits for /health.
 
         Args:
-            port (int)      : The port the instance should listen on
-            model_id (str)  : The model whose GPU mask is applied
+            port (int)          : The port the instance should listen on
+            model_id (str)      : The model the instance will host (for logging)
+            gpus (list[int])    : The GPU ids this replica is masked to
 
         Returns:
             The process pid if it became healthy, otherwise None
         """
-        print(f"[ROUTER] starting instance for {model_id} at port {port}...")
+        mask = ",".join(str(g) for g in gpus)
+        print(f"[ROUTER] starting instance for {model_id} at port {port} on gpus {mask}...")
         exe = self.router_config["llama-server-executable"]
         env = dict(os.environ)
-        gpus = self.model_gpus.get(model_id, [0])
-        mask = ",".join(str(g) for g in gpus)
         # Set both so the mask is backend-agnostic across CUDA and ROCm.
         env["CUDA_VISIBLE_DEVICES"] = mask
         env["HIP_VISIBLE_DEVICES"] = mask
@@ -875,24 +955,26 @@ class LLMRouter:
         print(f"[ROUTER] {self._last_load_error}", flush=True)
         return False
 
-    async def _spawn_replica(self, port: int, model_id: str) -> bool:
+    async def _spawn_replica(self, port: int, model_id: str, gpus: list[int]) -> bool:
         """
         Spawns and loads one replica hosting exactly model_id, with retries
 
         Args:
-            port (int)      : The port the replica should listen on
-            model_id (str)  : The model the replica hosts
+            port (int)          : The port the replica should listen on
+            model_id (str)      : The model the replica hosts
+            gpus (list[int])    : The GPU ids this replica is masked to
 
         Returns:
             True if the replica came up and loaded the model, else False
         """
         for attempt in range(self.START_RETRIES):
-            pid = await self._start_instance(port, model_id)
+            pid = await self._start_instance(port, model_id, gpus)
             if pid is None:
                 continue
             if await self._load_into(port, model_id):
                 self.port_model[port] = model_id
-                print(f"[ROUTER] replica for {model_id} up on port {port} (pid {pid})", flush=True)
+                self.port_gpus[port] = gpus
+                print(f"[ROUTER] replica for {model_id} up on port {port} on gpus {gpus} (pid {pid})", flush=True)
                 return True
             # A deterministic load failure hits the same wall on retry, so only retry a transient stall.
             fatal = self._last_load_fatal or self._replica_exited(port) is not None
@@ -927,6 +1009,7 @@ class LLMRouter:
             proc.wait() # reap (already-exited workers, e.g. OOM, land here too)
             del self.processes[port]
             self.port_model.pop(port, None)
+            self.port_gpus.pop(port, None)
             self.inflight.pop(port, None)
             return True
         except Exception:
@@ -1069,15 +1152,19 @@ class LLMRouter:
                     for mid in evict:
                         self._forget_model(mid)
 
-            # 2) spawn missing replicas, one process per replica
-            needed = target - len(have)
+            # 2) spawn missing replicas, one process per replica on its own mask
+            masks = self._replica_masks(model_id, target)
+            needed = len(masks)
             if needed > 0:
                 ports = self._alloc_ports(needed)
                 self._last_load_error = None
-                results = await asyncio.gather(
-                    *[self._spawn_replica(port, model_id) for port in ports],
-                    return_exceptions=True,
-                )
+                try:
+                    results = await asyncio.gather(
+                        *[self._spawn_replica(port, model_id, gpus) for port, gpus in zip(ports, masks)],
+                        return_exceptions=True,
+                    )
+                finally:
+                    self._unreserve_ports(ports)
                 up = sum(1 for r in results if r is True)
                 if up == 0:
                     reason = self._last_load_error or "no replica became healthy"
@@ -1427,8 +1514,8 @@ class LLMRouter:
                     continue
                 port = min(ports, key=lambda p: (self.inflight.get(p, 0), p))
                 entry["port"] = port
-                # Hold the hosting replica's own GPU pins as a shared reader.
-                entry["gpus"] = self.model_gpus.get(self.port_model.get(port, ""), list(range(self.num_gpus)))
+                # Hold the hosting replica's own GPU mask as a shared reader.
+                entry["gpus"] = self.port_gpus.get(port) or self.model_gpus.get(self.port_model.get(port, ""), list(range(self.num_gpus)))
                 self.inflight[port] = self.inflight.get(port, 0) + 1
 
             # Dispatch forwarding as a concurrent task, tracked so a dead client can cancel it
@@ -1463,6 +1550,7 @@ class LLMRouter:
         """
         gpus = entry.get("gpus", list(range(self.num_gpus)))
         await self._acquire_shared(gpus)
+        released = False
         try:
             port = entry["port"]
             req = entry["request"]
@@ -1478,6 +1566,10 @@ class LLMRouter:
                     headers=headers,
                     timeout=300.0,
                 )
+            # Free the replica before the client sees the reply, or a client firing its next
+            # request at once finds this replica still busy and least-busy routing doubles up.
+            self._release_port(port)
+            released = True
             entry["future"].set_result(resp)
             # Record history from usage/timings
             try:
@@ -1494,7 +1586,8 @@ class LLMRouter:
                 entry["future"].set_exception(e)
         finally:
             self.request_tasks.pop(entry["future"], None)
-            self._release_port(entry["port"])
+            if not released:
+                self._release_port(entry["port"])
             await asyncio.shield(self._release_shared(gpus))
 
     async def _do_forward_streaming(self, entry: dict[str, Any], queue: StreamQueue):

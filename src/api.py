@@ -194,6 +194,7 @@ async def router_status():
         "max_models_per_gpu": r.MAX_MODELS_PER_GPU,
         "eviction_policy": r.EVICTION_POLICY,
         "model_gpus": r.model_gpus,
+        "model_placements": r.model_placements,
     }
 
 @app.get("/router/start")
